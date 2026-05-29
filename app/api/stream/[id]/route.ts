@@ -66,11 +66,20 @@ export async function GET(
       return Response.json({ error: 'Stream vacio' }, { status: 500 });
     }
 
+    // Cap every response to 1 MB. Chrome cancels large open-ended range requests
+    // once it has buffered enough to start playback — if Content-Length promised
+    // more bytes than it consumed, the browser reports ERR_CONTENT_LENGTH_MISMATCH.
+    // Serving small self-contained chunks means Chrome always consumes every
+    // promised byte before requesting the next chunk.
+    const MAX_CHUNK = 1 * 1024 * 1024;
+    if (end - start + 1 > MAX_CHUNK) {
+      end = start + MAX_CHUNK - 1;
+      isRange = true;
+    }
+
     const chunkSize = end - start + 1;
 
     // Content-Length is required by Chrome's <video> element for 206 responses.
-    // Because totalSize comes from HEAD (authoritative RustFS value), end - start + 1
-    // is the exact byte count RustFS will deliver for this range.
     const headers: Record<string, string> = {
       'Content-Type': video.contentType,
       'Accept-Ranges': 'bytes',
