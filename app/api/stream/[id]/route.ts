@@ -31,8 +31,14 @@ export async function GET(
     }
 
     // Authoritative file size from RustFS (do not trust video.size in MongoDB).
-    const head = await headObject(video.s3Key);
-    const totalSize = head.ContentLength;
+    let totalSize: number | undefined;
+    try {
+      const head = await headObject(video.s3Key);
+      totalSize = head.ContentLength;
+    } catch (err) {
+      console.error('[stream] HEAD failed:', err);
+      return Response.json({ error: 'Error en HEAD', detail: err instanceof Error ? err.message : String(err) }, { status: 500 });
+    }
     if (totalSize === undefined) {
       return Response.json({ error: 'No se pudo determinar el tamano del video' }, { status: 500 });
     }
@@ -66,17 +72,23 @@ export async function GET(
       isRange = true;
     }
 
-    const s3Response = await getObject(video.s3Key, `bytes=${start}-${end}`);
-    const body = s3Response.Body;
-    if (!body) {
-      return Response.json({ error: 'Stream vacio' }, { status: 500 });
+    let buffer: Uint8Array;
+    try {
+      const s3Response = await getObject(video.s3Key, `bytes=${start}-${end}`);
+      const body = s3Response.Body;
+      if (!body) {
+        return Response.json({ error: 'Stream vacio' }, { status: 500 });
+      }
+      try {
+        buffer = await body.transformToByteArray();
+      } catch (err) {
+        console.error('[stream] transformToByteArray failed:', err);
+        return Response.json({ error: 'Error leyendo body', detail: err instanceof Error ? err.message : String(err) }, { status: 500 });
+      }
+    } catch (err) {
+      console.error('[stream] GET failed:', err);
+      return Response.json({ error: 'Error en GET', detail: err instanceof Error ? err.message : String(err) }, { status: 500 });
     }
-
-    // Read the full slice into memory. With MAX_CHUNK at 2 MB this is safe,
-    // and it lets us send an accurate Content-Length that matches the actual
-    // bytes returned (eliminates ERR_CONTENT_LENGTH_MISMATCH from RustFS lying
-    // about sizes or delivering a different number of bytes than promised).
-    const buffer = await body.transformToByteArray();
     const actualLength = buffer.byteLength;
     const actualEnd = start + actualLength - 1;
 
@@ -94,7 +106,9 @@ export async function GET(
     const status = isRange ? 206 : 200;
 
     return new Response(buffer, { status, headers });
-  } catch {
-    return Response.json({ error: 'Error obteniendo stream' }, { status: 500 });
+  } catch (err) {
+    console.error('[stream] error:', err);
+    const message = err instanceof Error ? err.message : String(err);
+    return Response.json({ error: 'Error obteniendo stream', detail: message }, { status: 500 });
   }
 }
