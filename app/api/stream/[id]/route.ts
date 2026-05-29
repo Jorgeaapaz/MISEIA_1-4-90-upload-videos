@@ -66,14 +66,15 @@ export async function GET(
       return Response.json({ error: 'Stream vacio' }, { status: 500 });
     }
 
-    // Do NOT set Content-Length. Letting Node send Transfer-Encoding: chunked
-    // means the browser does not validate the byte count against any promised
-    // length, so RustFS delivering a slightly different number of bytes than
-    // Content-Range implies cannot trigger ERR_CONTENT_LENGTH_MISMATCH. The
-    // browser computes the served range from Content-Range alone.
+    const chunkSize = end - start + 1;
+
+    // Content-Length is required by Chrome's <video> element for 206 responses.
+    // Because totalSize comes from HEAD (authoritative RustFS value), end - start + 1
+    // is the exact byte count RustFS will deliver for this range.
     const headers: Record<string, string> = {
       'Content-Type': video.contentType,
       'Accept-Ranges': 'bytes',
+      'Content-Length': String(chunkSize),
     };
 
     if (isRange) {
