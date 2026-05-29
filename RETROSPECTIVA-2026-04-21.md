@@ -299,6 +299,60 @@ if (start >= RUSTFS_BOUNDARY) {
 
 El primer cruce del boundary causa una descarga completa del video (~100-200 ms en localhost para 17 MB). Todos los seeks y chunks posteriores son instantaneos desde memoria.
 
+**Fix — boundary dinamico para archivos pequenos (2026-05-29):**
+
+Al probar con un video de 1.47 MB (`90007-16.mp4`) se descubrio que el boundary interno de RustFS **NO es fijo en 8 MB** — varia segun el archivo. Para el video pequeno el boundary estaba en **1 MB (1,048,576 bytes)**, rompiendo la solucion anterior que usaba `RUSTFS_BOUNDARY = 8 MB` como constante hardcodeada.
+
+Comportamiento confirmado con curl para el video de 1.47 MB:
+- `bytes=0-524287` → 206, 524288 bytes ✓ (dentro del primer chunk interno)
+- `bytes=524288-1048575` → 206, 524288 bytes ✓ (dentro del primer chunk interno)
+- `bytes=1048576-1537279` → 206, **0 bytes** ✗ (boundary a 1 MB, no 8 MB)
+- Sin Range header → 200, 1,537,280 bytes ✓
+
+Ademas se descubrio que `fetch` (undici) no devuelve 0 bytes para la respuesta vacia — en su lugar **lanza una excepcion `terminated`** antes de que `arrayBuffer()` sea alcanzado. La deteccion del boundary habia que hacerla en el `catch`, no inspeccionando `byteLength`.
+
+**Solucion final implementada (`app/api/stream/[id]/route.ts`):**
+Se elimino la constante `RUSTFS_BOUNDARY`. La deteccion del boundary es ahora completamente dinamica:
+
+1. Se intenta un range request normal (end capado a `video.size - 1`).
+2. Si `fetch` lanza cualquier error de transporte (terminated/ECONNRESET) O devuelve cuerpo vacio → se activa el fallback de cache.
+3. Primera vez que falla: se descarga el objeto completo (`GET` sin Range) y se guarda en `Map<string, Uint8Array>`.
+4. A partir de ese momento todos los chunks del video se sirven desde cache con `.subarray()`.
+
+```typescript
+try {
+  const resp = await fetch(presignedUrl, { headers: { Range: `bytes=${start}-${cappedEnd}` } });
+  const bytes = new Uint8Array(await resp.arrayBuffer());
+  if (bytes.byteLength === 0) { needsCache = true; }
+  else { buffer = bytes; /* ... */ }
+} catch (e) {
+  const msg = e instanceof Error ? e.message : String(e);
+  if (msg.startsWith('RustFS range fetch:')) throw e; // error real del servidor
+  needsCache = true; // terminated / ECONNRESET → boundary hit
+}
+
+if (needsCache) {
+  const fullResp = await fetch(presignedUrl); // sin Range
+  videoCache.set(video.s3Key, new Uint8Array(await fullResp.arrayBuffer()));
+  buffer = videoCache.get(video.s3Key)!.subarray(start, start + MAX_CHUNK);
+}
+```
+
+**Tests automatizados ejecutados (Node.js contra el servidor real):**
+
+| Test | Resultado |
+|------|-----------|
+| No Range (initial probe) | ✓ 206, 524288B |
+| bytes=0-524287 (chunk 1) | ✓ 206, 524288B |
+| bytes=524288-1048575 (chunk 2) | ✓ 206, 524288B |
+| bytes=1048576- (boundary hit) | ✓ 206, 488704B (desde cache) |
+| bytes=1048576-1537279 (exact last) | ✓ 206, 488704B (desde cache) |
+| bytes=1537279-1537279 (1 byte end) | ✓ 206, 1B (desde cache) |
+| bytes=1048576- (2nd call, cache hit) | ✓ 206, 488704B |
+| bytes=500000- (seek, cache hit) | ✓ 206, 524288B |
+
+8/8 pasados. La solucion es robusta para cualquier tamano de archivo.
+
 ### Pendiente para proxima sesion
 - Considerar agregar thumbnails/previews de video
 - Tests unitarios y de integracion
