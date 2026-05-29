@@ -31,14 +31,8 @@ export async function GET(
     }
 
     // Authoritative file size from RustFS (do not trust video.size in MongoDB).
-    let totalSize: number | undefined;
-    try {
-      const head = await headObject(video.s3Key);
-      totalSize = head.ContentLength;
-    } catch (err) {
-      console.error('[stream] HEAD failed:', err);
-      return Response.json({ error: 'Error en HEAD', detail: err instanceof Error ? err.message : String(err) }, { status: 500 });
-    }
+    const head = await headObject(video.s3Key);
+    const totalSize = head.ContentLength;
     if (totalSize === undefined) {
       return Response.json({ error: 'No se pudo determinar el tamano del video' }, { status: 500 });
     }
@@ -64,31 +58,23 @@ export async function GET(
       }
     }
 
-    // Cap range size to avoid buffering huge videos in memory.
-    // Browsers will request more chunks as needed via subsequent Range requests.
-    const MAX_CHUNK = 2 * 1024 * 1024; // 2 MB
+    // Cap each range response at 2 MB. The browser issues subsequent
+    // Range requests for the next chunks as it plays.
+    const MAX_CHUNK = 2 * 1024 * 1024;
     if (end - start + 1 > MAX_CHUNK) {
       end = start + MAX_CHUNK - 1;
       isRange = true;
     }
 
-    let buffer: Uint8Array;
-    try {
-      const s3Response = await getObject(video.s3Key, `bytes=${start}-${end}`);
-      const body = s3Response.Body;
-      if (!body) {
-        return Response.json({ error: 'Stream vacio' }, { status: 500 });
-      }
-      try {
-        buffer = await body.transformToByteArray();
-      } catch (err) {
-        console.error('[stream] transformToByteArray failed:', err);
-        return Response.json({ error: 'Error leyendo body', detail: err instanceof Error ? err.message : String(err) }, { status: 500 });
-      }
-    } catch (err) {
-      console.error('[stream] GET failed:', err);
-      return Response.json({ error: 'Error en GET', detail: err instanceof Error ? err.message : String(err) }, { status: 500 });
+    const s3Response = await getObject(video.s3Key, `bytes=${start}-${end}`);
+    const body = s3Response.Body;
+    if (!body) {
+      return Response.json({ error: 'Stream vacio' }, { status: 500 });
     }
+
+    // Buffer the slice fully and derive Content-Length from the actual byte
+    // count so headers cannot lie about the payload size.
+    const buffer = await body.transformToByteArray();
     const actualLength = buffer.byteLength;
     const actualEnd = start + actualLength - 1;
 
@@ -108,7 +94,6 @@ export async function GET(
     return new Response(buffer, { status, headers });
   } catch (err) {
     console.error('[stream] error:', err);
-    const message = err instanceof Error ? err.message : String(err);
-    return Response.json({ error: 'Error obteniendo stream', detail: message }, { status: 500 });
+    return Response.json({ error: 'Error obteniendo stream' }, { status: 500 });
   }
 }

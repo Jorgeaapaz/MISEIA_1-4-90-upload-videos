@@ -8,9 +8,15 @@ import {
   DeleteObjectCommand,
 } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
+import { NodeHttpHandler } from '@smithy/node-http-handler';
+import { Agent as HttpAgent } from 'http';
+import { Agent as HttpsAgent } from 'https';
 
 const BUCKET = process.env.RUSTFS_BUCKET!;
 
+// RustFS does not reliably support HTTP/1.1 keep-alive connection reuse: the
+// server closes the socket after a response but the SDK reuses it for the next
+// request, causing ECONNRESET. Force a fresh connection per request.
 export const s3Client = new S3Client({
   endpoint: process.env.RUSTFS_ENDPOINT!,
   region: 'us-east-1',
@@ -21,6 +27,10 @@ export const s3Client = new S3Client({
   forcePathStyle: true,
   requestChecksumCalculation: 'WHEN_REQUIRED',
   responseChecksumValidation: 'WHEN_REQUIRED',
+  requestHandler: new NodeHttpHandler({
+    httpAgent: new HttpAgent({ keepAlive: false }),
+    httpsAgent: new HttpsAgent({ keepAlive: false }),
+  }),
 });
 
 let bucketReady = false;
