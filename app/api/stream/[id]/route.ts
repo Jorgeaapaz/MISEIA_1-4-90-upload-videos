@@ -2,7 +2,7 @@ import { ObjectId } from 'mongodb';
 import { Readable } from 'stream';
 import { getDb } from '@/lib/mongodb';
 import { authenticateRequest } from '@/lib/auth';
-import { getObject } from '@/lib/s3';
+import { getObject, headObject } from '@/lib/s3';
 import type { VideoMetadata } from '@/lib/types';
 
 export async function GET(
@@ -31,9 +31,15 @@ export async function GET(
       return Response.json({ error: 'No autorizado' }, { status: 403 });
     }
 
-    const totalSize = video.size;
+    // HEAD for authoritative size from RustFS. video.size in MongoDB cannot be
+    // trusted (the upload may have stored fewer/more bytes than file.size).
+    const head = await headObject(video.s3Key);
+    const totalSize = head.ContentLength;
+    if (totalSize === undefined || totalSize <= 0) {
+      return Response.json({ error: 'No se pudo determinar el tamano' }, { status: 500 });
+    }
 
-    // Parse browser Range header.
+    // Parse the browser Range header against the authoritative size.
     const rangeHeader = request.headers.get('Range');
     let start = 0;
     let end = totalSize - 1;
@@ -54,18 +60,20 @@ export async function GET(
       }
     }
 
-    const chunkSize = end - start + 1;
-
     const s3Response = await getObject(video.s3Key, `bytes=${start}-${end}`);
     const body = s3Response.Body;
     if (!body) {
       return Response.json({ error: 'Stream vacio' }, { status: 500 });
     }
 
+    // Do NOT set Content-Length. Letting Node send Transfer-Encoding: chunked
+    // means the browser does not validate the byte count against any promised
+    // length, so RustFS delivering a slightly different number of bytes than
+    // Content-Range implies cannot trigger ERR_CONTENT_LENGTH_MISMATCH. The
+    // browser computes the served range from Content-Range alone.
     const headers: Record<string, string> = {
       'Content-Type': video.contentType,
       'Accept-Ranges': 'bytes',
-      'Content-Length': String(chunkSize),
     };
 
     if (isRange) {
@@ -74,10 +82,8 @@ export async function GET(
 
     const status = isRange ? 206 : 200;
 
-    // Stream directly from RustFS to the client. Use the Node Readable directly
-    // (the SDK Body is a Node Readable) and convert to a Web ReadableStream that
-    // swallows abort/reset errors silently — the browser cancelling a video
-    // range probe is normal and should not generate server errors.
+    // Stream directly from RustFS to the client via Node Readable events.
+    // Bytes flow as they arrive, so the browser does not cancel out of impatience.
     const nodeStream = body as Readable;
     const webStream = new ReadableStream<Uint8Array>({
       start(controller) {
@@ -92,28 +98,21 @@ export async function GET(
           try {
             controller.enqueue(new Uint8Array(chunk));
           } catch {
-            // Controller may be closed if the client disconnected.
             closed = true;
             nodeStream.destroy();
           }
         });
         nodeStream.on('end', safeClose);
         nodeStream.on('close', safeClose);
-        nodeStream.on('error', () => {
-          // RustFS / network errors during streaming: close the response
-          // gracefully instead of bubbling up as a 500.
-          safeClose();
-        });
+        nodeStream.on('error', safeClose);
       },
       cancel() {
-        // Client disconnected: tear down the upstream read.
         nodeStream.destroy();
       },
     });
 
     return new Response(webStream, { status, headers });
   } catch (err) {
-    // Truly unexpected errors only — by this point the response has not started.
     if (err instanceof Error && (err.name === 'AbortError' || (err as NodeJS.ErrnoException).code === 'ECONNRESET')) {
       return new Response(null, { status: 499 });
     }
