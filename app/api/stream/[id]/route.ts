@@ -4,14 +4,15 @@ import { authenticateRequest } from '@/lib/auth';
 import { getPresignedDownloadUrl } from '@/lib/s3';
 import type { VideoMetadata } from '@/lib/types';
 
-// RustFS bug: any range request with start >= 8 MB returns 206 with 0 bytes,
-// regardless of end position. Only ranges starting before 8 MB work (even
-// those that cross the boundary). The full-object GET (no Range) is fine.
+// RustFS bug: range requests that start at or after an internal chunk boundary
+// terminate the connection (or return 0 bytes) instead of serving data. The
+// boundary offset varies per file. Full-object GET always works.
 //
-// Fix for start >= 8 MB: fetch the full object once, cache it in module
-// memory, and serve all subsequent chunks from the cache. In dev the server
-// process is long-lived, so the cache persists across requests.
-const RUSTFS_BOUNDARY = 8 * 1024 * 1024;
+// Strategy:
+//  1. Try a capped range request.
+//  2. If it throws (connection terminated) or returns empty body, fall back:
+//     fetch the full object once and cache it in module memory.
+//  3. Subsequent requests for the same video slice from the cache directly.
 const MAX_CHUNK = 512 * 1024;
 
 const videoCache = new Map<string, Uint8Array>();
@@ -54,30 +55,57 @@ export async function GET(
     let buffer: Uint8Array;
     let totalSize = video.size;
 
-    if (start >= RUSTFS_BOUNDARY) {
-      // Any range starting at or past 8 MB returns 0 bytes from RustFS.
-      // Fetch the full object once and serve all post-boundary chunks from
-      // the in-memory cache.
-      if (!videoCache.has(video.s3Key)) {
-        const resp = await fetch(presignedUrl);
-        if (!resp.ok) throw new Error(`RustFS full-object fetch: ${resp.status}`);
-        videoCache.set(video.s3Key, new Uint8Array(await resp.arrayBuffer()));
-      }
+    if (videoCache.has(video.s3Key)) {
+      // Already cached from a previous boundary hit — serve from memory.
       const data = videoCache.get(video.s3Key)!;
       totalSize = data.byteLength;
       buffer = data.subarray(start, Math.min(start + MAX_CHUNK, data.byteLength));
     } else {
-      // start < 8 MB: normal range request.
-      const cappedEnd = start + MAX_CHUNK - 1;
-      const resp = await fetch(presignedUrl, {
-        headers: { Range: `bytes=${start}-${cappedEnd}` },
-      });
-      if (!resp.ok && resp.status !== 206) {
-        throw new Error(`RustFS range fetch: ${resp.status}`);
+      // Cap end to video.size-1 to avoid requesting past EOF.
+      const cappedEnd = Math.min(start + MAX_CHUNK - 1, video.size - 1);
+
+      let needsCache = false;
+      let raw: Uint8Array | null = null;
+      let contentRange: string | null = null;
+
+      try {
+        const resp = await fetch(presignedUrl, {
+          headers: { Range: `bytes=${start}-${cappedEnd}` },
+        });
+        if (!resp.ok && resp.status !== 206) {
+          throw new Error(`RustFS range fetch: ${resp.status}`);
+        }
+        const bytes = new Uint8Array(await resp.arrayBuffer());
+        if (bytes.byteLength === 0) {
+          // RustFS returned 206 with empty body — boundary hit.
+          needsCache = true;
+        } else {
+          raw = bytes;
+          contentRange = resp.headers.get('content-range');
+        }
+      } catch (e) {
+        // Connection terminated by RustFS at a chunk boundary.
+        // Re-throw only if this is not a transport-level error.
+        const msg = e instanceof Error ? e.message : String(e);
+        if (msg.startsWith('RustFS range fetch:')) throw e;
+        needsCache = true;
       }
-      buffer = new Uint8Array(await resp.arrayBuffer());
-      const cr = resp.headers.get('content-range');
-      if (cr) { const m = cr.match(/\/(\d+)$/); if (m) totalSize = Number(m[1]); }
+
+      if (needsCache) {
+        // Fetch the full object once and cache it for all future chunks.
+        const fullResp = await fetch(presignedUrl);
+        if (!fullResp.ok) throw new Error(`RustFS full-object fetch: ${fullResp.status}`);
+        videoCache.set(video.s3Key, new Uint8Array(await fullResp.arrayBuffer()));
+        const data = videoCache.get(video.s3Key)!;
+        totalSize = data.byteLength;
+        buffer = data.subarray(start, Math.min(start + MAX_CHUNK, data.byteLength));
+      } else {
+        buffer = raw!;
+        if (contentRange) {
+          const m = contentRange.match(/\/(\d+)$/);
+          if (m) totalSize = Number(m[1]);
+        }
+      }
     }
 
     const actualLength = buffer.byteLength;
