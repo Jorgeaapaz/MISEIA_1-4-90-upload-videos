@@ -30,15 +30,14 @@ export async function GET(
       return Response.json({ error: 'No autorizado' }, { status: 403 });
     }
 
-    // Get the authoritative file size directly from RustFS (HEAD).
-    // Do NOT trust video.size from MongoDB — it can drift from the actual stored object.
+    // Authoritative file size from RustFS (do not trust video.size in MongoDB).
     const head = await headObject(video.s3Key);
     const totalSize = head.ContentLength;
     if (totalSize === undefined) {
       return Response.json({ error: 'No se pudo determinar el tamano del video' }, { status: 500 });
     }
 
-    // Parse the browser's Range header against the authoritative size.
+    // Parse browser Range header against the authoritative size.
     const rangeHeader = request.headers.get('Range');
     let start = 0;
     let end = totalSize - 1;
@@ -59,7 +58,13 @@ export async function GET(
       }
     }
 
-    const chunkSize = end - start + 1;
+    // Cap range size to avoid buffering huge videos in memory.
+    // Browsers will request more chunks as needed via subsequent Range requests.
+    const MAX_CHUNK = 2 * 1024 * 1024; // 2 MB
+    if (end - start + 1 > MAX_CHUNK) {
+      end = start + MAX_CHUNK - 1;
+      isRange = true;
+    }
 
     const s3Response = await getObject(video.s3Key, `bytes=${start}-${end}`);
     const body = s3Response.Body;
@@ -67,70 +72,28 @@ export async function GET(
       return Response.json({ error: 'Stream vacio' }, { status: 500 });
     }
 
-    // Build headers entirely from our own values; ignore RustFS response headers.
+    // Read the full slice into memory. With MAX_CHUNK at 2 MB this is safe,
+    // and it lets us send an accurate Content-Length that matches the actual
+    // bytes returned (eliminates ERR_CONTENT_LENGTH_MISMATCH from RustFS lying
+    // about sizes or delivering a different number of bytes than promised).
+    const buffer = await body.transformToByteArray();
+    const actualLength = buffer.byteLength;
+    const actualEnd = start + actualLength - 1;
+
     const headers: Record<string, string> = {
       'Content-Type': video.contentType,
       'Accept-Ranges': 'bytes',
-      'Content-Length': String(chunkSize),
+      'Content-Length': String(actualLength),
       'Cache-Control': 'no-store',
     };
 
     if (isRange) {
-      headers['Content-Range'] = `bytes ${start}-${end}/${totalSize}`;
+      headers['Content-Range'] = `bytes ${start}-${actualEnd}/${totalSize}`;
     }
 
     const status = isRange ? 206 : 200;
 
-    // Stream exactly chunkSize bytes:
-    // - If S3 sends more, truncate the tail.
-    // - If S3 sends less (or errors), pad the deficit with zero bytes so the byte
-    //   count matches Content-Length. Better to deliver a slightly garbled tail
-    //   than to trigger ERR_CONTENT_LENGTH_MISMATCH and break <video> entirely.
-    const reader = body.transformToWebStream().getReader();
-    let delivered = 0;
-    const safeStream = new ReadableStream<Uint8Array>({
-      async pull(controller) {
-        if (delivered >= chunkSize) {
-          try { controller.close(); } catch { /* already closed */ }
-          return;
-        }
-        try {
-          const { done, value } = await reader.read();
-          if (done) {
-            const deficit = chunkSize - delivered;
-            if (deficit > 0) {
-              controller.enqueue(new Uint8Array(deficit));
-              delivered += deficit;
-            }
-            try { controller.close(); } catch { /* already closed */ }
-            return;
-          }
-          let chunk = value;
-          if (delivered + chunk.byteLength > chunkSize) {
-            chunk = chunk.slice(0, chunkSize - delivered);
-          }
-          delivered += chunk.byteLength;
-          controller.enqueue(chunk);
-          if (delivered >= chunkSize) {
-            try { controller.close(); } catch { /* already closed */ }
-          }
-        } catch {
-          const deficit = chunkSize - delivered;
-          if (deficit > 0) {
-            try {
-              controller.enqueue(new Uint8Array(deficit));
-              delivered += deficit;
-            } catch { /* controller already errored */ }
-          }
-          try { controller.close(); } catch { /* already closed */ }
-        }
-      },
-      cancel() {
-        reader.cancel().catch(() => {});
-      },
-    });
-
-    return new Response(safeStream, { status, headers });
+    return new Response(buffer, { status, headers });
   } catch {
     return Response.json({ error: 'Error obteniendo stream' }, { status: 500 });
   }
