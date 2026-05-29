@@ -31,7 +31,12 @@ export async function GET(
     }
 
     const range = request.headers.get('Range') || undefined;
-    const s3Response = await getObject(video.s3Key, range);
+    const s3Response = await getObject(video.s3Key, range, request.signal);
+
+    const body = s3Response.Body;
+    if (!body) {
+      return Response.json({ error: 'Stream vacio' }, { status: 500 });
+    }
 
     const headers: Record<string, string> = {
       'Content-Type': video.contentType,
@@ -48,8 +53,11 @@ export async function GET(
 
     const status = s3Response.ContentRange ? 206 : 200;
 
-    return new Response(s3Response.Body as ReadableStream, { status, headers });
-  } catch {
+    return new Response(body.transformToWebStream(), { status, headers });
+  } catch (err) {
+    if (err instanceof Error && (err.name === 'AbortError' || (err as NodeJS.ErrnoException).code === 'ECONNRESET')) {
+      return new Response(null, { status: 499 });
+    }
     return Response.json({ error: 'Error obteniendo stream' }, { status: 500 });
   }
 }

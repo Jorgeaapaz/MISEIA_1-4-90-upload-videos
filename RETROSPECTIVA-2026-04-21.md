@@ -140,6 +140,10 @@ npm run start
 | http://localhost:3000/dashboard | Dashboard (requiere login) |
 | http://localhost:3000/upload | Subir video (requiere login) |
 | http://localhost:3000/videos | Listado de videos (requiere login) |
+| http://localhost:10000 | RustFS (Running in Local PC Docker)|
+| http://localhost:10001 | RustFS Console (Running in Local PC Docker)|
+| http://localhost:27017 | MongoDB (Running in Local PC)|
+
 
 ### Probar API con curl
 
@@ -200,6 +204,7 @@ Esta aplicacion corre localmente en Windows. No requiere configuracion NAT ni po
 | Params asincronos en Next.js 16 | Todos los `params` en route handlers y pages se manejan como `Promise` con `await params` segun la convencion de Next.js 16. |
 | AWS SDK v3 agrega `x-amz-checksum-mode=ENABLED` a presigned URLs | Se configuro el S3Client con `requestChecksumCalculation: 'WHEN_REQUIRED'` y `responseChecksumValidation: 'WHEN_REQUIRED'` para evitar el parametro extra. No fue suficiente para resolver el error de streaming. |
 | `ERR_CONTENT_LENGTH_MISMATCH 206` al reproducir videos con presigned URLs directas a Rustfs | **Problema critico**: Rustfs no maneja correctamente las Range requests del `<video>` HTML5 cuando se usan presigned URLs directas. El browser solicita rangos de bytes (206 Partial Content) pero Rustfs devuelve un `Content-Length` inconsistente, rompiendo la reproduccion. **Solucion**: Se reemplazo el enfoque de presigned GET URLs por un **proxy server-side** en `/api/stream/[id]`. Ahora Next.js lee el video desde Rustfs via AWS SDK (`GetObjectCommand` con `Range` header) y reenvia el stream al browser con headers `Content-Range` y `Content-Length` correctos. El VideoPlayer usa `/api/stream/{id}` como `src` directamente y la cookie `token` autentica automaticamente. |
+| `Error: failed to pipe response` / `ECONNRESET` al reproducir videos (`/api/stream/[id]` devuelve 500) | **Causa**: El cuerpo de respuesta del AWS SDK (`s3Response.Body`) es un stream de Node.js (`SdkStreamMixin`), no un `ReadableStream` de la Web API. Al hacer `as ReadableStream` y pasarlo a `new Response()`, Next.js intentaba hacer pipe de un tipo incompatible, fallando con `ECONNRESET`. Ademas, cuando el browser cancela la peticion (seek o cierre), el pipe lanzaba error sin manejar. **Solucion**: Se reemplazo el cast por `body.transformToWebStream()` (metodo del SDK que convierte correctamente al tipo Web API). Se paso `request.signal` a `getObject()` para cancelar el request a Rustfs cuando el browser desconecta. Se capturo `AbortError`/`ECONNRESET` en el catch para retornar 499 en vez de 500. |
 
 ## Arquitectura / Architecture
 
@@ -253,6 +258,10 @@ Se descubrio que **Rustfs no soporta correctamente Range requests via presigned 
 - `lib/s3.ts` — Se agrego `requestChecksumCalculation: 'WHEN_REQUIRED'` y `responseChecksumValidation: 'WHEN_REQUIRED'` al S3Client. Se agrego funcion `getObject(key, range?)` para leer objetos directamente con soporte de Range.
 - `app/api/stream/[id]/route.ts` — Se reemplazo completamente: ya no devuelve presigned URL, ahora hace proxy del video leyendo de Rustfs server-side y reenviando con headers `Content-Range`, `Content-Length` y status 206 correctos.
 - `components/VideoPlayer.tsx` — Simplificado: usa `/api/stream/{id}` como `src` del `<video>` directamente. La cookie `token` autentica automaticamente sin necesidad de fetch previo ni presigned URL.
+
+**Fix adicional — `Error: failed to pipe response` (2026-05-28):**
+- `lib/s3.ts` — `getObject()` acepta ahora un tercer parametro `abortSignal?: AbortSignal` y lo pasa al `s3Client.send()` para cancelar el request a Rustfs cuando el browser desconecta.
+- `app/api/stream/[id]/route.ts` — Se reemplazo `s3Response.Body as ReadableStream` por `body.transformToWebStream()` (conversion correcta de Node.js stream a Web ReadableStream). Se pasa `request.signal` a `getObject()`. Se captura `AbortError`/`ECONNRESET` para devolver 499 en vez de propagar el error como 500.
 
 ### Pendiente para proxima sesion
 - Considerar agregar thumbnails/previews de video
