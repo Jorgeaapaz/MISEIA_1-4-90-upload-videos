@@ -39,9 +39,8 @@ export async function GET(
       if (m) start = Number(m[1]);
     }
 
-    // 1 MB per chunk. S3/RustFS automatically clamps the end if it exceeds the
-    // object size and reports the real end in Content-Range.
-    const MAX_CHUNK = 1 * 1024 * 1024;
+    // 512 KB per chunk — smaller than 1 MB to reduce RustFS connection stress.
+    const MAX_CHUNK = 512 * 1024;
     const requestedEnd = start + MAX_CHUNK - 1;
 
     const s3Response = await getObject(video.s3Key, `bytes=${start}-${requestedEnd}`);
@@ -76,7 +75,8 @@ export async function GET(
       },
     });
   } catch (err) {
-    console.error('[stream] error:', err);
-    return Response.json({ error: 'Error obteniendo stream' }, { status: 500 });
+    const detail = err instanceof Error ? `${err.message} (code: ${(err as NodeJS.ErrnoException).code ?? 'none'})` : String(err);
+    console.error('[stream] error:', detail);
+    return Response.json({ error: 'Error obteniendo stream', detail }, { status: 500 });
   }
 }
