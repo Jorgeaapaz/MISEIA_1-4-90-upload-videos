@@ -4,12 +4,17 @@ import { authenticateRequest } from '@/lib/auth';
 import { getPresignedDownloadUrl } from '@/lib/s3';
 import type { VideoMetadata } from '@/lib/types';
 
-// RustFS internal object-chunk size. Range requests that start at or cross
-// this boundary cause ECONNRESET / connection termination. We work around it
-// by (a) never letting a chunk cross the boundary and (b) falling back to a
-// full-object stream + byte-skip for requests that start exactly at one.
+// RustFS bug: any range request with start >= 8 MB returns 206 with 0 bytes,
+// regardless of end position. Only ranges starting before 8 MB work (even
+// those that cross the boundary). The full-object GET (no Range) is fine.
+//
+// Fix for start >= 8 MB: fetch the full object once, cache it in module
+// memory, and serve all subsequent chunks from the cache. In dev the server
+// process is long-lived, so the cache persists across requests.
 const RUSTFS_BOUNDARY = 8 * 1024 * 1024;
 const MAX_CHUNK = 512 * 1024;
+
+const videoCache = new Map<string, Uint8Array>();
 
 export async function GET(
   request: Request,
@@ -49,52 +54,21 @@ export async function GET(
     let buffer: Uint8Array;
     let totalSize = video.size;
 
-    const isBoundaryStart = start > 0 && start % RUSTFS_BOUNDARY === 0;
-
-    if (isBoundaryStart) {
-      // RustFS cannot serve range requests starting at its internal 8 MB chunk
-      // boundary. Fetch the full object sequentially and skip to the offset.
-      const resp = await fetch(presignedUrl);
-      if (!resp.ok) throw new Error(`RustFS full-object fetch: ${resp.status}`);
-
-      const reader = resp.body!.getReader();
-      const chunks: Uint8Array[] = [];
-      let skipped = 0;
-      let buffered = 0;
-
-      try {
-        while (buffered < MAX_CHUNK) {
-          const { done, value } = await reader.read();
-          if (done) break;
-
-          if (skipped < start) {
-            const toSkip = Math.min(value.byteLength, start - skipped);
-            skipped += toSkip;
-            if (toSkip < value.byteLength) {
-              const useful = value.subarray(toSkip);
-              const take = Math.min(useful.byteLength, MAX_CHUNK - buffered);
-              chunks.push(useful.subarray(0, take));
-              buffered += take;
-            }
-          } else {
-            const take = Math.min(value.byteLength, MAX_CHUNK - buffered);
-            chunks.push(value.subarray(0, take));
-            buffered += take;
-          }
-        }
-      } finally {
-        reader.cancel().catch(() => {});
+    if (start >= RUSTFS_BOUNDARY) {
+      // Any range starting at or past 8 MB returns 0 bytes from RustFS.
+      // Fetch the full object once and serve all post-boundary chunks from
+      // the in-memory cache.
+      if (!videoCache.has(video.s3Key)) {
+        const resp = await fetch(presignedUrl);
+        if (!resp.ok) throw new Error(`RustFS full-object fetch: ${resp.status}`);
+        videoCache.set(video.s3Key, new Uint8Array(await resp.arrayBuffer()));
       }
-
-      buffer = new Uint8Array(buffered);
-      let off = 0;
-      for (const c of chunks) { buffer.set(c, off); off += c.byteLength; }
-
+      const data = videoCache.get(video.s3Key)!;
+      totalSize = data.byteLength;
+      buffer = data.subarray(start, Math.min(start + MAX_CHUNK, data.byteLength));
     } else {
-      // Normal case: cap the chunk so it never crosses an 8 MB boundary.
-      const nextBoundary = (Math.floor(start / RUSTFS_BOUNDARY) + 1) * RUSTFS_BOUNDARY;
-      const cappedEnd = Math.min(start + MAX_CHUNK - 1, nextBoundary - 1);
-
+      // start < 8 MB: normal range request.
+      const cappedEnd = start + MAX_CHUNK - 1;
       const resp = await fetch(presignedUrl, {
         headers: { Range: `bytes=${start}-${cappedEnd}` },
       });
@@ -103,10 +77,7 @@ export async function GET(
       }
       buffer = new Uint8Array(await resp.arrayBuffer());
       const cr = resp.headers.get('content-range');
-      if (cr) {
-        const m = cr.match(/\/(\d+)$/);
-        if (m) totalSize = Number(m[1]);
-      }
+      if (cr) { const m = cr.match(/\/(\d+)$/); if (m) totalSize = Number(m[1]); }
     }
 
     const actualLength = buffer.byteLength;
