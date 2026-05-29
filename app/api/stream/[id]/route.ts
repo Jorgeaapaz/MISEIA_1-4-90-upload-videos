@@ -1,7 +1,7 @@
 import { ObjectId } from 'mongodb';
 import { getDb } from '@/lib/mongodb';
 import { authenticateRequest } from '@/lib/auth';
-import { getObject } from '@/lib/s3';
+import { getPresignedDownloadUrl } from '@/lib/s3';
 import type { VideoMetadata } from '@/lib/types';
 
 export async function GET(
@@ -39,23 +39,23 @@ export async function GET(
       if (m) start = Number(m[1]);
     }
 
-    // 512 KB per chunk — smaller than 1 MB to reduce RustFS connection stress.
     const MAX_CHUNK = 512 * 1024;
+    const requestedEnd = start + MAX_CHUNK - 1;
 
-    // RustFS always resets the connection when a range request starts exactly
-    // on its internal 8 MB object-chunk boundary. Shift the S3 request back
-    // by 1 byte and strip it from the buffer so the browser receives the
-    // correct data at the correct offset.
-    const RUSTFS_BOUNDARY = 8 * 1024 * 1024;
-    const trimBytes = (start > 0 && start % RUSTFS_BOUNDARY === 0) ? 1 : 0;
-    const adjustedStart = start - trimBytes;
-    const requestedEnd = adjustedStart + MAX_CHUNK - 1;
+    // The AWS SDK's NodeHttpHandler causes ECONNRESET at RustFS's internal
+    // 8 MB chunk boundaries. Using a presigned URL with Node's undici-based
+    // fetch avoids that transport entirely.
+    const presignedUrl = await getPresignedDownloadUrl(video.s3Key);
+    const fetchResponse = await fetch(presignedUrl, {
+      headers: { Range: `bytes=${start}-${requestedEnd}` },
+    });
 
-    const s3Response = await getObject(video.s3Key, `bytes=${adjustedStart}-${requestedEnd}`);
-    if (!s3Response.Body) throw new Error('Empty body');
-    const raw = await s3Response.Body.transformToByteArray();
-    const buffer = trimBytes > 0 ? raw.subarray(trimBytes) : raw;
-    const sContentRange = s3Response.ContentRange;
+    if (!fetchResponse.ok && fetchResponse.status !== 206) {
+      throw new Error(`RustFS responded with status ${fetchResponse.status}`);
+    }
+
+    const buffer = new Uint8Array(await fetchResponse.arrayBuffer());
+    const sContentRange = fetchResponse.headers.get('content-range') ?? undefined;
 
     const actualLength = buffer.byteLength;
     const actualEnd = start + actualLength - 1;
