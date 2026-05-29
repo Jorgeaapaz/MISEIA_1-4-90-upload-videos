@@ -263,6 +263,42 @@ Se descubrio que **Rustfs no soporta correctamente Range requests via presigned 
 - `lib/s3.ts` — `getObject()` acepta ahora un tercer parametro `abortSignal?: AbortSignal` y lo pasa al `s3Client.send()` para cancelar el request a Rustfs cuando el browser desconecta.
 - `app/api/stream/[id]/route.ts` — Se reemplazo `s3Response.Body as ReadableStream` por `body.transformToWebStream()` (conversion correcta de Node.js stream a Web ReadableStream). Se pasa `request.signal` a `getObject()`. Se captura `AbortError`/`ECONNRESET` para devolver 499 en vez de propagar el error como 500.
 
+**Fix critico — ECONNRESET en boundary interno de RustFS (2026-05-29):**
+
+Tras multiples iteraciones fallidas se descubrio que RustFS tiene un bug grave con range requests: devuelve **HTTP 206 con 0 bytes** para cualquier request donde `start >= 8,388,608` (8 MB). No es un error de red ni del cliente HTTP — es RustFS devolviendo una respuesta vacia sin indicar error.
+
+Proceso de diagnostico:
+1. Se intentaron varias aproximaciones (retry con backoff, keepAlive: false, shift de 1 byte, fetch con undici) — todas fallaban porque el problema es en RustFS, no en el cliente.
+2. La clave fue hacer tests directos con `curl` usando una presigned URL real, que revelo el `206 / 0 bytes` como respuesta de RustFS para starts >= 8 MB.
+3. Se confirmo que ranges que CRUZAN el boundary (start < 8 MB, end > 8 MB) funcionan correctamente.
+4. Se confirmo que GET sin Range header (objeto completo) funciona correctamente.
+
+Comportamiento confirmado con curl:
+- `bytes=0-524287` → 206, 524288 bytes ✓
+- `bytes=8388608-8912895` → 206, **0 bytes** ✗ (bug de RustFS)
+- `bytes=8388609-8912895` → 206, **0 bytes** ✗
+- `bytes=8000000-8524287` (cruza boundary) → 206, 524288 bytes ✓
+- Sin Range header (objeto completo) → 200, 17,481,215 bytes ✓
+
+**Solucion implementada (`app/api/stream/[id]/route.ts`):**
+- `start < 8 MB`: range request normal de 512 KB via presigned URL + `fetch()`.
+- `start >= 8 MB`: se descarga el objeto completo una sola vez via `fetch(presignedUrl)` (sin Range header) y se almacena en un `Map<string, Uint8Array>` a nivel de modulo. Los chunks sucesivos se sirven con `.subarray()` desde cache — zero requests extra a RustFS tras el primer miss.
+
+```typescript
+const videoCache = new Map<string, Uint8Array>();
+
+if (start >= RUSTFS_BOUNDARY) {
+  if (!videoCache.has(video.s3Key)) {
+    const resp = await fetch(presignedUrl); // sin Range header
+    videoCache.set(video.s3Key, new Uint8Array(await resp.arrayBuffer()));
+  }
+  const data = videoCache.get(video.s3Key)!;
+  buffer = data.subarray(start, Math.min(start + MAX_CHUNK, data.byteLength));
+}
+```
+
+El primer cruce del boundary causa una descarga completa del video (~100-200 ms en localhost para 17 MB). Todos los seeks y chunks posteriores son instantaneos desde memoria.
+
 ### Pendiente para proxima sesion
 - Considerar agregar thumbnails/previews de video
 - Tests unitarios y de integracion
