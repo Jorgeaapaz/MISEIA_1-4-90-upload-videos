@@ -31,7 +31,9 @@ export async function GET(
     }
 
     const range = request.headers.get('Range') || undefined;
-    const s3Response = await getObject(video.s3Key, range, request.signal);
+    // Do NOT pass request.signal: the browser cancels range-probe requests normally,
+    // which would abort the S3 TCP connection mid-flight and cause ECONNRESET.
+    const s3Response = await getObject(video.s3Key, range);
 
     const body = s3Response.Body;
     if (!body) {
@@ -53,11 +55,29 @@ export async function GET(
 
     const status = s3Response.ContentRange ? 206 : 200;
 
-    return new Response(body.transformToWebStream(), { status, headers });
-  } catch (err) {
-    if (err instanceof Error && (err.name === 'AbortError' || (err as NodeJS.ErrnoException).code === 'ECONNRESET')) {
-      return new Response(null, { status: 499 });
-    }
+    // Pull-based wrapper: errors from S3 (abort, reset) close the stream
+    // gracefully instead of propagating as a stream error to Next.js.
+    const reader = body.transformToWebStream().getReader();
+    const safeStream = new ReadableStream<Uint8Array>({
+      async pull(controller) {
+        try {
+          const { done, value } = await reader.read();
+          if (done) {
+            try { controller.close(); } catch { /* already closed */ }
+          } else {
+            controller.enqueue(value);
+          }
+        } catch {
+          try { controller.close(); } catch { /* already closed */ }
+        }
+      },
+      cancel() {
+        reader.cancel().catch(() => {});
+      },
+    });
+
+    return new Response(safeStream, { status, headers });
+  } catch {
     return Response.json({ error: 'Error obteniendo stream' }, { status: 500 });
   }
 }

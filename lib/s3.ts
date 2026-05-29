@@ -52,13 +52,13 @@ export async function getPresignedDownloadUrl(key: string): Promise<string> {
   return getSignedUrl(s3Client, command, { expiresIn: 3600 });
 }
 
-export async function getObject(key: string, range?: string, abortSignal?: AbortSignal) {
+export async function getObject(key: string, range?: string) {
   const command = new GetObjectCommand({
     Bucket: BUCKET,
     Key: key,
     ...(range ? { Range: range } : {}),
   });
-  return s3Client.send(command, { abortSignal });
+  return s3Client.send(command);
 }
 
 export async function deleteObject(key: string): Promise<void> {
