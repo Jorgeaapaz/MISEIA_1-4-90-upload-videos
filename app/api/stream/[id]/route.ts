@@ -4,6 +4,13 @@ import { authenticateRequest } from '@/lib/auth';
 import { getPresignedDownloadUrl } from '@/lib/s3';
 import type { VideoMetadata } from '@/lib/types';
 
+// RustFS internal object-chunk size. Range requests that start at or cross
+// this boundary cause ECONNRESET / connection termination. We work around it
+// by (a) never letting a chunk cross the boundary and (b) falling back to a
+// full-object stream + byte-skip for requests that start exactly at one.
+const RUSTFS_BOUNDARY = 8 * 1024 * 1024;
+const MAX_CHUNK = 512 * 1024;
+
 export async function GET(
   request: Request,
   { params }: { params: Promise<{ id: string }> }
@@ -30,8 +37,6 @@ export async function GET(
       return Response.json({ error: 'No autorizado' }, { status: 403 });
     }
 
-    // Parse the start byte from the browser's Range header.
-    // Always request a capped range so RustFS never has to deliver large payloads.
     const rangeHeader = request.headers.get('Range');
     let start = 0;
     if (rangeHeader) {
@@ -39,34 +44,73 @@ export async function GET(
       if (m) start = Number(m[1]);
     }
 
-    const MAX_CHUNK = 512 * 1024;
-    const requestedEnd = start + MAX_CHUNK - 1;
-
-    // The AWS SDK's NodeHttpHandler causes ECONNRESET at RustFS's internal
-    // 8 MB chunk boundaries. Using a presigned URL with Node's undici-based
-    // fetch avoids that transport entirely.
     const presignedUrl = await getPresignedDownloadUrl(video.s3Key);
-    const fetchResponse = await fetch(presignedUrl, {
-      headers: { Range: `bytes=${start}-${requestedEnd}` },
-    });
 
-    if (!fetchResponse.ok && fetchResponse.status !== 206) {
-      throw new Error(`RustFS responded with status ${fetchResponse.status}`);
+    let buffer: Uint8Array;
+    let totalSize = video.size;
+
+    const isBoundaryStart = start > 0 && start % RUSTFS_BOUNDARY === 0;
+
+    if (isBoundaryStart) {
+      // RustFS cannot serve range requests starting at its internal 8 MB chunk
+      // boundary. Fetch the full object sequentially and skip to the offset.
+      const resp = await fetch(presignedUrl);
+      if (!resp.ok) throw new Error(`RustFS full-object fetch: ${resp.status}`);
+
+      const reader = resp.body!.getReader();
+      const chunks: Uint8Array[] = [];
+      let skipped = 0;
+      let buffered = 0;
+
+      try {
+        while (buffered < MAX_CHUNK) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          if (skipped < start) {
+            const toSkip = Math.min(value.byteLength, start - skipped);
+            skipped += toSkip;
+            if (toSkip < value.byteLength) {
+              const useful = value.subarray(toSkip);
+              const take = Math.min(useful.byteLength, MAX_CHUNK - buffered);
+              chunks.push(useful.subarray(0, take));
+              buffered += take;
+            }
+          } else {
+            const take = Math.min(value.byteLength, MAX_CHUNK - buffered);
+            chunks.push(value.subarray(0, take));
+            buffered += take;
+          }
+        }
+      } finally {
+        reader.cancel().catch(() => {});
+      }
+
+      buffer = new Uint8Array(buffered);
+      let off = 0;
+      for (const c of chunks) { buffer.set(c, off); off += c.byteLength; }
+
+    } else {
+      // Normal case: cap the chunk so it never crosses an 8 MB boundary.
+      const nextBoundary = (Math.floor(start / RUSTFS_BOUNDARY) + 1) * RUSTFS_BOUNDARY;
+      const cappedEnd = Math.min(start + MAX_CHUNK - 1, nextBoundary - 1);
+
+      const resp = await fetch(presignedUrl, {
+        headers: { Range: `bytes=${start}-${cappedEnd}` },
+      });
+      if (!resp.ok && resp.status !== 206) {
+        throw new Error(`RustFS range fetch: ${resp.status}`);
+      }
+      buffer = new Uint8Array(await resp.arrayBuffer());
+      const cr = resp.headers.get('content-range');
+      if (cr) {
+        const m = cr.match(/\/(\d+)$/);
+        if (m) totalSize = Number(m[1]);
+      }
     }
-
-    const buffer = new Uint8Array(await fetchResponse.arrayBuffer());
-    const sContentRange = fetchResponse.headers.get('content-range') ?? undefined;
 
     const actualLength = buffer.byteLength;
     const actualEnd = start + actualLength - 1;
-
-    // Derive totalSize from the RustFS Content-Range response header.
-    // Fall back to video.size only if Content-Range is absent.
-    let totalSize = video.size;
-    if (sContentRange) {
-      const m = sContentRange.match(/\/(\d+)$/);
-      if (m) totalSize = Number(m[1]);
-    }
 
     return new Response(buffer, {
       status: 206,
