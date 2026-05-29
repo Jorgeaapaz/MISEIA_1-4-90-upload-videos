@@ -43,25 +43,34 @@ export async function GET(
     const MAX_CHUNK = 512 * 1024;
     const requestedEnd = start + MAX_CHUNK - 1;
 
-    const s3Response = await getObject(video.s3Key, `bytes=${start}-${requestedEnd}`);
-    const body = s3Response.Body;
-    if (!body) {
-      return Response.json({ error: 'Stream vacio' }, { status: 500 });
+    // Fetch the chunk with up to 3 retries. RustFS resets connections at its
+    // internal 8 MB object-chunk boundary; a short back-off and retry recovers.
+    let buffer!: Uint8Array;
+    let sContentRange: string | undefined;
+    let lastError: unknown;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (attempt > 0) await new Promise(r => setTimeout(r, 100 * attempt));
+      try {
+        const s3Response = await getObject(video.s3Key, `bytes=${start}-${requestedEnd}`);
+        if (!s3Response.Body) throw new Error('Empty body');
+        buffer = await s3Response.Body.transformToByteArray();
+        sContentRange = s3Response.ContentRange;
+        lastError = undefined;
+        break;
+      } catch (e) {
+        lastError = e;
+      }
     }
+    if (lastError) throw lastError;
 
-    // Buffer the slice. With 1 MB cap and keepAlive:false this completes quickly.
-    // Using buffer.byteLength for Content-Length means the header is ALWAYS
-    // accurate — even if RustFS delivers fewer bytes than the range implies.
-    const buffer = await body.transformToByteArray();
     const actualLength = buffer.byteLength;
     const actualEnd = start + actualLength - 1;
 
-    // Derive totalSize from the RustFS Content-Range response header, which
-    // carries the correct object size even when ContentLength is wrong.
+    // Derive totalSize from the RustFS Content-Range response header.
     // Fall back to video.size only if Content-Range is absent.
     let totalSize = video.size;
-    if (s3Response.ContentRange) {
-      const m = s3Response.ContentRange.match(/\/(\d+)$/);
+    if (sContentRange) {
+      const m = sContentRange.match(/\/(\d+)$/);
       if (m) totalSize = Number(m[1]);
     }
 
