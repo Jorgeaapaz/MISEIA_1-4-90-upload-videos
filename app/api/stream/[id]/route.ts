@@ -41,27 +41,21 @@ export async function GET(
 
     // 512 KB per chunk — smaller than 1 MB to reduce RustFS connection stress.
     const MAX_CHUNK = 512 * 1024;
-    const requestedEnd = start + MAX_CHUNK - 1;
 
-    // Fetch the chunk with up to 3 retries. RustFS resets connections at its
-    // internal 8 MB object-chunk boundary; a short back-off and retry recovers.
-    let buffer!: Uint8Array;
-    let sContentRange: string | undefined;
-    let lastError: unknown;
-    for (let attempt = 0; attempt < 3; attempt++) {
-      if (attempt > 0) await new Promise(r => setTimeout(r, 100 * attempt));
-      try {
-        const s3Response = await getObject(video.s3Key, `bytes=${start}-${requestedEnd}`);
-        if (!s3Response.Body) throw new Error('Empty body');
-        buffer = await s3Response.Body.transformToByteArray();
-        sContentRange = s3Response.ContentRange;
-        lastError = undefined;
-        break;
-      } catch (e) {
-        lastError = e;
-      }
-    }
-    if (lastError) throw lastError;
+    // RustFS always resets the connection when a range request starts exactly
+    // on its internal 8 MB object-chunk boundary. Shift the S3 request back
+    // by 1 byte and strip it from the buffer so the browser receives the
+    // correct data at the correct offset.
+    const RUSTFS_BOUNDARY = 8 * 1024 * 1024;
+    const trimBytes = (start > 0 && start % RUSTFS_BOUNDARY === 0) ? 1 : 0;
+    const adjustedStart = start - trimBytes;
+    const requestedEnd = adjustedStart + MAX_CHUNK - 1;
+
+    const s3Response = await getObject(video.s3Key, `bytes=${adjustedStart}-${requestedEnd}`);
+    if (!s3Response.Body) throw new Error('Empty body');
+    const raw = await s3Response.Body.transformToByteArray();
+    const buffer = trimBytes > 0 ? raw.subarray(trimBytes) : raw;
+    const sContentRange = s3Response.ContentRange;
 
     const actualLength = buffer.byteLength;
     const actualEnd = start + actualLength - 1;
