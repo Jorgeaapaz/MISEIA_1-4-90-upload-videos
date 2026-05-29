@@ -4,6 +4,7 @@ import {
   CreateBucketCommand,
   PutObjectCommand,
   GetObjectCommand,
+  HeadObjectCommand,
   DeleteObjectCommand,
 } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
@@ -58,6 +59,11 @@ export async function getObject(key: string, range?: string) {
     Key: key,
     ...(range ? { Range: range } : {}),
   });
+  return s3Client.send(command);
+}
+
+export async function headObject(key: string) {
+  const command = new HeadObjectCommand({ Bucket: BUCKET, Key: key });
   return s3Client.send(command);
 }
 
