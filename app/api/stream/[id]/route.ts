@@ -45,12 +45,16 @@ export async function GET(
       'Accept-Ranges': 'bytes',
     };
 
-    if (s3Response.ContentLength !== undefined) {
-      headers['Content-Length'] = String(s3Response.ContentLength);
-    }
-
     if (s3Response.ContentRange) {
       headers['Content-Range'] = s3Response.ContentRange;
+      // RustFS reports ContentLength = total file size even on 206 responses.
+      // Derive the correct value from Content-Range (end - start + 1) instead.
+      const m = s3Response.ContentRange.match(/bytes (\d+)-(\d+)\//);
+      if (m) {
+        headers['Content-Length'] = String(Number(m[2]) - Number(m[1]) + 1);
+      }
+    } else if (s3Response.ContentLength !== undefined) {
+      headers['Content-Length'] = String(s3Response.ContentLength);
     }
 
     const status = s3Response.ContentRange ? 206 : 200;
