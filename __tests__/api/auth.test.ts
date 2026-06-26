@@ -1,9 +1,8 @@
-import { signToken } from '@/lib/auth';
-
-// Mock lib/mongodb
+// Mock lib/mongodb — require() is required in jest.mock factories (hoisting constraint)
+// eslint-disable-next-line @typescript-eslint/no-require-imports
 jest.mock('@/lib/mongodb', () => require('../__mocks__/mongodb'));
 
-import { getDb, ensureIndexes, mockCollection, mockDb } from '../__mocks__/mongodb';
+import { getDb, mockCollection, mockDb } from '../__mocks__/mongodb';
 
 // ── Helper to build a request ──────────────────────────────────────────────────
 function makeRequest(method: string, body?: unknown, token?: string): Request {

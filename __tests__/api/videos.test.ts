@@ -1,4 +1,5 @@
 import { signToken } from '@/lib/auth';
+import { getDb } from '@/lib/mongodb';
 
 const userId = 'aaaaaaaaaaaaaaaaaaaaaaaa'; // valid 24-char hex ObjectId string
 const validToken = signToken({ userId, email: 'user@test.com', name: 'Test User' });
@@ -29,8 +30,6 @@ const mockCollection = {
   insertOne: mockInsertOne,
   countDocuments: mockCountDocuments,
 };
-const mockDb = { collection: jest.fn(() => mockCollection) };
-
 jest.mock('@/lib/mongodb', () => ({
   getDb: jest.fn().mockResolvedValue({
     collection: jest.fn(() => mockCollection),
@@ -57,8 +56,7 @@ describe('GET /api/videos', () => {
   });
 
   it('[debug] mock is wired', async () => {
-    const { getDb } = require('@/lib/mongodb');
-    const db = await getDb();
+    const db = await (getDb as jest.Mock)();
     const coll = db.collection('videos');
     const chain = coll.find({});
     const arr = await chain.sort({}).skip(0).limit(10).toArray();

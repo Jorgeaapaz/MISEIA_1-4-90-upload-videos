@@ -3,6 +3,7 @@
  * Run: node scripts/benchmark-auth.js
  */
 
+// eslint-disable-next-line @typescript-eslint/no-require-imports
 const jwt = require('jsonwebtoken');
 
 const SECRET = process.env.JWT_SECRET || 'benchmark-test-secret-32charslong!!';

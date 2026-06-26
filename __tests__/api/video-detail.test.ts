@@ -1,4 +1,5 @@
 import { signToken } from '@/lib/auth';
+import { getDb } from '@/lib/mongodb';
 
 const userId = 'aaaaaaaaaaaaaaaaaaaaaaaa';
 const validToken = signToken({ userId, email: 'user@test.com', name: 'Test User' });
@@ -39,7 +40,6 @@ function makeRequest(method: string, url: string, token?: string): Request {
 describe('GET /api/auth/me', () => {
   beforeEach(() => {
     jest.clearAllMocks();
-    const { getDb } = require('@/lib/mongodb');
     (getDb as jest.Mock).mockResolvedValue({ collection: jest.fn(() => mockCollection) });
   });
 
@@ -75,7 +75,6 @@ describe('GET /api/auth/me', () => {
 describe('GET /api/videos/[id]', () => {
   beforeEach(() => {
     jest.clearAllMocks();
-    const { getDb } = require('@/lib/mongodb');
     (getDb as jest.Mock).mockResolvedValue({ collection: jest.fn(() => mockCollection) });
   });
 
@@ -128,7 +127,6 @@ describe('GET /api/videos/[id]', () => {
 describe('DELETE /api/videos/[id]', () => {
   beforeEach(() => {
     jest.clearAllMocks();
-    const { getDb } = require('@/lib/mongodb');
     (getDb as jest.Mock).mockResolvedValue({ collection: jest.fn(() => mockCollection) });
   });
 
