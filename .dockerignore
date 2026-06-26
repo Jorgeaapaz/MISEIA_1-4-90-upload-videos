@@ -1,0 +1,15 @@
+.next/
+node_modules/
+.env*
+!.env.example
+coverage/
+docs/
+*.md
+!README.md
+.git/
+.gitignore
+tsconfig.test.json
+jest.config.ts
+jest.setup.ts
+__tests__/
+proxy.ts

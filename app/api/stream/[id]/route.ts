@@ -111,7 +111,7 @@ export async function GET(
     const actualLength = buffer.byteLength;
     const actualEnd = start + actualLength - 1;
 
-    return new Response(buffer, {
+    return new Response(buffer as unknown as BodyInit, {
       status: 206,
       headers: {
         'Content-Type': video.contentType,

@@ -1,6 +1,57 @@
 # VideoVault — Video Upload & Management Platform
 
+[![CI](https://github.com/Jorgeaapaz/MISEIA_1-4-90-upload-videos/actions/workflows/ci-cd.yml/badge.svg)](https://github.com/Jorgeaapaz/MISEIA_1-4-90-upload-videos/actions/workflows/ci-cd.yml)
+![Coverage](https://img.shields.io/badge/coverage-74%25-brightgreen)
+
 A **Next.js 16 full-stack web application** that lets authenticated users upload, manage, search, and stream videos stored in an S3-compatible object store (RustFS), with metadata persisted in MongoDB.
+
+---
+
+## Architecture
+
+### Component Diagram
+
+```mermaid
+graph TD
+    Browser["🌐 Browser\n(React / Next.js UI)"]
+    NextAPI["⚡ Next.js 16\nAPI Routes :3000"]
+    JWT["🔐 JWT Auth\n(jsonwebtoken + bcrypt)"]
+    MongoDB[("🍃 MongoDB\nUsers & Video Metadata")]
+    RustFS[("🗄️ RustFS S3\nVideo Binary Storage")]
+
+    Browser -->|"POST /api/auth/login\nPOST /api/auth/register"| NextAPI
+    NextAPI -->|"Sign / Verify Token"| JWT
+    Browser -->|"GET /api/videos\nPOST /api/videos\nDELETE /api/videos/[id]"| NextAPI
+    NextAPI -->|"CRUD users & video metadata"| MongoDB
+    Browser -->|"POST /api/upload/presign"| NextAPI
+    NextAPI -->|"GeneratePresignedPutUrl"| RustFS
+    Browser -->|"PUT direct upload\n(presigned URL)"| RustFS
+    Browser -->|"GET /api/stream/[id]\n(byte-range)"| NextAPI
+    NextAPI -->|"GetObject + Range proxy"| RustFS
+    Browser -->|"GET /api/dashboard/stats"| NextAPI
+    NextAPI -->|"Aggregate stats"| MongoDB
+```
+
+### Upload Flow (Sequence)
+
+```mermaid
+sequenceDiagram
+    participant B as Browser
+    participant API as Next.js API
+    participant S3 as RustFS
+    participant DB as MongoDB
+
+    B->>API: POST /api/upload/presign {filename, contentType}
+    API->>S3: GeneratePresignedPutUrl(key, contentType, 15min)
+    S3-->>API: presigned URL
+    API-->>B: {url, key}
+    B->>S3: PUT binary (direct, presigned URL)
+    S3-->>B: 200 OK
+    B->>API: POST /api/videos {key, name, description, tags, metadata}
+    API->>DB: insertOne(videoMetadata)
+    DB-->>API: insertedId
+    API-->>B: 201 {video}
+```
 
 ---
 
@@ -130,7 +181,13 @@ cd MISEIA_1-4-90-upload-videos
 
 ### Environment
 
-Create a `.env.local` file at the project root:
+Copy `.env.example` to `.env.local` and fill in your values:
+
+```bash
+cp .env.example .env.local
+```
+
+All required variables with their descriptions are documented in `.env.example`. For a local dev setup with default RustFS credentials:
 
 ```env
 MONGODB_URI=mongodb://localhost:27017
@@ -139,7 +196,7 @@ RUSTFS_ENDPOINT=http://localhost:10000
 RUSTFS_ACCESS_KEY=minioadmin
 RUSTFS_SECRET_KEY=minioadmin1234
 RUSTFS_BUCKET=videos
-JWT_SECRET=upload-videos-dev-secret-2024
+JWT_SECRET=<generate with: node -e "console.log(require('crypto').randomBytes(32).toString('hex'))">
 ```
 
 ### Install & Run
@@ -151,11 +208,86 @@ npm run dev
 
 Open [http://localhost:3000](http://localhost:3000).
 
+### Run Tests
+
+```bash
+npm test              # Run all tests
+npm run test:coverage # Run tests with coverage report
+```
+
+Open [http://localhost:3000](http://localhost:3000).
+
 ### Build for Production
 
 ```bash
 npm run build
 npm start
+```
+
+---
+
+## AI Usage
+
+This project was developed with AI assistance. See [docs/AI_USAGE.md](docs/AI_USAGE.md) for a detailed breakdown of which modules were AI-assisted and the specific changes made to each generated draft.
+
+---
+
+## Technical Decisions
+
+See [docs/DECISIONS.md](docs/DECISIONS.md) for detailed architectural decisions and trade-offs including:
+- Presigned URLs vs. server-side upload
+- JWT stateless auth vs. session store
+- MongoDB vs. PostgreSQL for flexible metadata
+- Byte-range proxy vs. direct presigned GET URLs
+
+Formal Architecture Decision Records (ADRs) are in [docs/adr/](docs/adr/).
+
+Quantitative benchmarks justifying key decisions: [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+
+---
+
+## Deploy to Production
+
+The application is containerized and deploys to a GCP VM behind Traefik with automatic HTTPS.
+
+**Live:** https://videovault.deviaaps.com
+
+### Prerequisites
+- Docker and docker-compose on the target VM
+- Traefik running in the VM with `miseia-net` Docker network
+- SSH access to `gcvmuser@34.174.56.186`
+
+### Manual Deploy
+
+```bash
+# 1. SSH into the VM
+ssh -i ~/.ssh/vboxuser gcvmuser@34.174.56.186
+
+# 2. Clone / update the project
+git clone https://github.com/Jorgeaapaz/MISEIA_1-4-90-upload-videos.git MISEIA190_upload-videos
+cd MISEIA190_upload-videos
+
+# 3. Create .env.prod with production values (NEVER commit this file)
+cat > .env.prod << 'EOF'
+MONGODB_URI=mongodb://admin:<password>@34.174.56.186:27020/?authSource=admin
+MONGODB_DB=videovault
+RUSTFS_ENDPOINT=http://rustfs:9000
+RUSTFS_ACCESS_KEY=<access-key>
+RUSTFS_SECRET_KEY=<secret-key>
+RUSTFS_BUCKET=videos
+JWT_SECRET=<generate: node -e "console.log(require('crypto').randomBytes(32).toString('hex'))">
+NODE_ENV=production
+EOF
+
+# 4. Build and start
+docker compose -f docker-compose.prod.yml up -d --build
+```
+
+### Automated Deploy Script
+
+```bash
+# From your local machine (set SSH_KEY to your key path)
+SSH_KEY=~/.ssh/vboxuser ./deploy.sh
 ```
 
 ---
@@ -208,3 +340,30 @@ GET /api/videos           (no Authorization header)
 | Database | MongoDB 7 (native driver) |
 | Auth | JWT (`jsonwebtoken`) + bcrypt (`bcryptjs`) |
 | Language | TypeScript 5 |
+
+---
+
+## Updates — 2026-06-26
+
+### New files added
+
+| File / Directory | Description |
+|---|---|
+| `__tests__/` | Jest unit & integration test suite (API routes, auth, stream, upload) |
+| `jest.config.ts` | Jest configuration with Next.js transform and path aliases |
+| `jest.setup.ts` | Jest global setup (fetch polyfill, env vars) |
+| `tsconfig.test.json` | TypeScript config extending base for test files |
+| `Dockerfile` | Multi-stage production Docker image |
+| `.dockerignore` | Docker build context exclusions |
+| `docker-compose.prod.yml` | Production compose file (app + RustFS + MongoDB via Traefik) |
+| `deploy.sh` | One-command SSH deploy script to GCP VM |
+| `scripts/` | Utility scripts (seed data, bucket init, health checks) |
+| `.env.example` | Documented template for all required environment variables |
+| `.github/workflows/` | GitHub Actions CI/CD pipeline (lint, test, build, deploy) |
+| `.gitlab-ci.yml` | GitLab CI mirror pipeline |
+
+### Bug fixes
+
+- **RustFS 8 MB streaming boundary fix** (`app/api/stream/[id]/route.ts`): RustFS returns a 206 with 0 bytes for any range request starting at or beyond the 8 MB boundary. The stream route now caches the full object in-memory and serves byte slices directly for files ≤ 50 MB, bypassing the RustFS range bug transparently.
+- **`next.config.ts`**: updated allowed image/video hosts; adjusted headers for range-request passthrough.
+- **`package.json` / `package-lock.json`**: added `jest`, `@types/jest`, `jest-environment-node`, `ts-jest`, and `@aws-sdk/s3-request-presigner` dev dependencies.

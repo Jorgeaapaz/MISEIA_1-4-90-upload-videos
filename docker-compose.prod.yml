@@ -1,0 +1,22 @@
+services:
+  videovault:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: videovault
+    restart: unless-stopped
+    env_file:
+      - .env.prod
+    networks:
+      - miseia-net
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.videovault.rule=Host(`videovault.deviaaps.com`)"
+      - "traefik.http.routers.videovault.entrypoints=websecure"
+      - "traefik.http.routers.videovault.tls=true"
+      - "traefik.http.routers.videovault.tls.certresolver=cloudflare"
+      - "traefik.http.services.videovault.loadbalancer.server.port=3000"
+
+networks:
+  miseia-net:
+    external: true

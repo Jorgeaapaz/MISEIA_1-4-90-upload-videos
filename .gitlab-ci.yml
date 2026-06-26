@@ -1,0 +1,96 @@
+stages:
+  - test
+  - build
+  - deploy
+
+variables:
+  NODE_VERSION: "20"
+
+# ── Cache node_modules by package-lock hash ──────────────────────────────────
+.node_cache: &node_cache
+  cache:
+    key:
+      files:
+        - package-lock.json
+    paths:
+      - node_modules/
+
+# ── Lint & Test ───────────────────────────────────────────────────────────────
+test:
+  stage: test
+  image: node:20-alpine
+  <<: *node_cache
+  before_script:
+    - npm ci
+  script:
+    - npm run lint
+    - npm test
+  artifacts:
+    when: always
+    reports:
+      junit: junit.xml
+
+# ── Build ─────────────────────────────────────────────────────────────────────
+build:
+  stage: build
+  image: node:20-alpine
+  <<: *node_cache
+  needs: [test]
+  before_script:
+    - npm ci
+  script:
+    # NODE_ENV=production is set ONLY for the build command, not as job-level variable
+    - NODE_ENV=production npm run build
+  artifacts:
+    paths:
+      - .next/
+    expire_in: 1 hour
+
+# ── Deploy (master/main only) ─────────────────────────────────────────────────
+deploy:
+  stage: deploy
+  image: alpine:latest
+  needs: [build]
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "main"'
+  before_script:
+    - apk add --no-cache openssh-client rsync
+    - mkdir -p ~/.ssh
+    - echo "$VM_SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
+    - chmod 600 ~/.ssh/deploy_key
+    - ssh-keyscan -H $VM_HOST >> ~/.ssh/known_hosts
+  script:
+    # Create target directory on VM
+    - ssh -i ~/.ssh/deploy_key ${VM_USER}@${VM_HOST} "mkdir -p ${VM_DEPLOY_DIR}"
+
+    # Write .env.prod on VM from CI variables
+    - |
+      ssh -i ~/.ssh/deploy_key ${VM_USER}@${VM_HOST} "cat > ${VM_DEPLOY_DIR}/.env.prod << 'ENVEOF'
+      MONGODB_URI=${PROD_MONGODB_URI}
+      MONGODB_DB=videovault
+      RUSTFS_ENDPOINT=${PROD_RUSTFS_ENDPOINT}
+      RUSTFS_ACCESS_KEY=${PROD_RUSTFS_ACCESS_KEY}
+      RUSTFS_SECRET_KEY=${PROD_RUSTFS_SECRET_KEY}
+      RUSTFS_BUCKET=videos
+      JWT_SECRET=${PROD_JWT_SECRET}
+      NODE_ENV=production
+      ENVEOF"
+
+    # Sync files to VM
+    - |
+      rsync -avz \
+        --exclude '.next/' \
+        --exclude 'node_modules/' \
+        --exclude '.env*' \
+        --exclude 'coverage/' \
+        --exclude '.git/' \
+        -e "ssh -i ~/.ssh/deploy_key" \
+        ./ ${VM_USER}@${VM_HOST}:${VM_DEPLOY_DIR}/
+
+    # Build and start Docker container on VM
+    - |
+      ssh -i ~/.ssh/deploy_key ${VM_USER}@${VM_HOST} "
+        cd ${VM_DEPLOY_DIR}
+        docker compose -f docker-compose.prod.yml up -d --build
+        docker compose -f docker-compose.prod.yml ps
+      "
