@@ -74,6 +74,7 @@ jobs:
           MONGODB_URI=${{ secrets.PROD_MONGODB_URI }}
           MONGODB_DB=videovault
           RUSTFS_ENDPOINT=${{ secrets.PROD_RUSTFS_ENDPOINT }}
+          RUSTFS_PUBLIC_ENDPOINT=${{ secrets.PROD_RUSTFS_PUBLIC_ENDPOINT }}
           RUSTFS_ACCESS_KEY=${{ secrets.PROD_RUSTFS_ACCESS_KEY }}
           RUSTFS_SECRET_KEY=${{ secrets.PROD_RUSTFS_SECRET_KEY }}
           RUSTFS_BUCKET=videos
