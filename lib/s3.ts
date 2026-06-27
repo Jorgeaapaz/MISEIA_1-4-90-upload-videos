@@ -2,6 +2,7 @@ import {
   S3Client,
   HeadBucketCommand,
   CreateBucketCommand,
+  PutBucketCorsCommand,
   PutObjectCommand,
   GetObjectCommand,
   HeadObjectCommand,
@@ -48,6 +49,25 @@ export async function ensureBucket(): Promise<void> {
     await s3Client.send(new HeadBucketCommand({ Bucket: BUCKET }));
   } catch {
     await s3Client.send(new CreateBucketCommand({ Bucket: BUCKET }));
+  }
+  // Apply CORS so browsers can PUT directly via presigned URLs from any origin.
+  // Wrapped in try/catch — some RustFS builds don't implement PutBucketCors;
+  // uploads will still work server-side even if this call is a no-op.
+  try {
+    await s3Client.send(new PutBucketCorsCommand({
+      Bucket: BUCKET,
+      CORSConfiguration: {
+        CORSRules: [{
+          AllowedOrigins: ['*'],
+          AllowedMethods: ['GET', 'PUT', 'POST', 'DELETE', 'HEAD'],
+          AllowedHeaders: ['*'],
+          ExposeHeaders: ['ETag'],
+          MaxAgeSeconds: 3600,
+        }],
+      },
+    }));
+  } catch {
+    // CORS API not supported by this build — uploads still work server-side.
   }
   bucketReady = true;
 }
